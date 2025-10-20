@@ -11,6 +11,8 @@ from pathlib import Path
 import time
 import json
 import hashlib
+import base64
+import argparse
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -20,6 +22,10 @@ API_KEY = os.getenv("SORA_API_KEY")
 MODEL = os.getenv("SORA_MODEL", "sora-2-pro")
 DURATION = os.getenv("SORA_DURATION", "8")
 SIZE = os.getenv("SORA_SIZE", "1280x720")
+REFERENCE_IMAGE = os.getenv("SORA_REFERENCE_IMAGE")
+
+# Variable globale pour suivre l'image de référence utilisée
+current_reference_image_path = None
 
 # URL de l'API Sora2
 API_BASE_URL = "https://api.openai.com/v1/videos"
@@ -28,7 +34,7 @@ API_BASE_URL = "https://api.openai.com/v1/videos"
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 5  # secondes
 
-def save_metadata(video_id, prompt, status, error=None):
+def save_metadata(video_id, prompt, status, error=None, reference_image_path=None):
     """Sauvegarde les métadonnées de la vidéo pour récupération ultérieure"""
     metadata_dir = Path("metadata")
     metadata_dir.mkdir(exist_ok=True)
@@ -43,6 +49,11 @@ def save_metadata(video_id, prompt, status, error=None):
         "timestamp": int(time.time()),
         "error": error
     }
+
+    # Ajouter les informations sur l'image de référence si fournie
+    global current_reference_image_path
+    if current_reference_image_path:
+        metadata["reference_image"] = current_reference_image_path
 
     metadata_file = metadata_dir / f"{video_id}.json"
     with open(metadata_file, "w", encoding="utf-8") as f:
@@ -63,6 +74,83 @@ def read_prompt():
         lines = [line for line in content.split("\n") if line.strip() and not line.startswith("#")]
         return "\n".join(lines)
 
+def read_reference_image(image_path):
+    """Lit une image de référence et la convertit en base64"""
+    if not image_path:
+        return None
+
+    # Vérifier si c'est une URL
+    if image_path.startswith(('http://', 'https://')):
+        print("❌ Erreur: Les URLs ne sont pas supportées pour les images de référence")
+        print("   Veuillez placer votre image dans le répertoire 'input_reference/'")
+        return None
+
+    # Fichier local - vérifier qu'il est dans input_reference/
+    image_file = Path(image_path)
+    if not image_file.exists():
+        print(f"❌ Erreur: Le fichier image '{image_path}' n'existe pas")
+        return None
+
+    # Vérifier que le fichier est dans le répertoire input_reference/
+    try:
+        image_file_abs = image_file.resolve()
+        input_ref_dir = Path("input_reference").resolve()
+        if not str(image_file_abs).startswith(str(input_ref_dir)):
+            print(f"❌ Erreur: L'image doit être placée dans le répertoire 'input_reference/'")
+            print(f"   Chemin actuel: {image_file}")
+            print(f"   Répertoire requis: input_reference/")
+            return None
+    except Exception:
+        print(f"❌ Erreur: Impossible de vérifier le chemin de l'image")
+        return None
+
+    # Vérifier l'extension
+    valid_extensions = {'.jpg', '.jpeg', '.png'}
+    if image_file.suffix.lower() not in valid_extensions:
+        print(f"❌ Erreur: Format d'image non supporté. Formats supportés: {', '.join(valid_extensions)}")
+        return None
+
+    try:
+        from PIL import Image
+        # Vérifier les dimensions de l'image
+        with Image.open(image_file) as img:
+            width, height = img.size
+            expected_size = SIZE  # Format "1280x720"
+            expected_width, expected_height = map(int, expected_size.split('x'))
+
+            print(f"📏 Dimensions de l'image: {width}x{height}")
+            print(f"📏 Dimensions requises: {expected_width}x{expected_height}")
+
+            if width != expected_width or height != expected_height:
+                print(f"❌ Erreur: Les dimensions de l'image ne correspondent pas à SORA_SIZE={SIZE}")
+                print(f"   Image actuelle: {width}x{height}")
+                print(f"   Attendu: {expected_width}x{expected_height}")
+                print(f"   Veuillez redimensionner l'image ou modifier SORA_SIZE dans le .env")
+                return None
+            else:
+                print(f"✅ Dimensions de l'image correctes")
+    except ImportError:
+        print("⚠️  Attention: PIL/Pillow n'est pas installé. Impossible de vérifier les dimensions de l'image.")
+        print("   Installez avec: pip install Pillow")
+    except Exception as e:
+        print(f"⚠️  Attention: Impossible de vérifier les dimensions de l'image: {e}")
+
+    try:
+        with open(image_file, "rb") as f:
+            image_data = f.read()
+    except Exception as e:
+        print(f"❌ Erreur lors de la lecture du fichier image: {e}")
+        return None
+
+    # Encoder en base64
+    try:
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        print(f"✅ Image de référence chargée ({len(image_data):,} bytes)")
+        return base64_image
+    except Exception as e:
+        print(f"❌ Erreur lors de l'encodage de l'image: {e}")
+        return None
+
 def check_moderation_error(error_response):
     """Détecte si l'erreur est liée à la modération"""
     if not error_response:
@@ -80,33 +168,58 @@ def check_moderation_error(error_response):
 
     return any(keyword in error_text for keyword in moderation_keywords)
 
-def generate_video(prompt):
+def generate_video(prompt, reference_image_base64=None):
     """Génère une vidéo en utilisant l'API Sora2"""
     if not API_KEY or API_KEY == "your_api_key_here":
         print("Erreur: Veuillez configurer votre clé API dans le fichier .env")
         sys.exit(1)
 
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "seconds": DURATION,
-        "size": SIZE
+        "Authorization": f"Bearer {API_KEY}"
     }
 
     print(f"Génération de la vidéo avec les paramètres:")
     print(f"  - Model: {MODEL}")
     print(f"  - Duration: {DURATION}s")
     print(f"  - Size: {SIZE}")
+    if reference_image_base64:
+        print(f"  - Image de référence: ✅")
+    else:
+        print(f"  - Image de référence: ❌")
     print(f"  - Prompt: {prompt[:100]}...")
+    
+    # Demander confirmation avant l'appel API
+    print("\n" + "="*50)
+    print("⚠️  ATTENTION: Cet appel va générer des coûts sur votre compte OpenAI")
+    print("="*50)
+    
+    confirmation = input("\nVoulez-vous continuer avec la génération de vidéo ? (oui/non): ").lower().strip()
+    
+    if confirmation not in ['oui', 'o', 'yes', 'y']:
+        print("❌ Génération annulée par l'utilisateur")
+        return None
+    
     print("\nEnvoi de la requête à l'API...")
 
+    # Préparer les données pour multipart/form-data
+    data = {
+        "model": MODEL,
+        "prompt": prompt,
+        "seconds": DURATION,
+        "size": SIZE
+    }
+    
+    files = {}
+    
+    # Ajouter l'image de référence si fournie
+    if reference_image_base64:
+        # Convertir base64 en bytes pour l'upload
+        import base64
+        image_data = base64.b64decode(reference_image_base64)
+        files["input_reference"] = ("reference_image.jpg", image_data, "image/jpeg")
+
     try:
-        response = requests.post(API_BASE_URL, headers=headers, json=payload)
+        response = requests.post(API_BASE_URL, headers=headers, data=data, files=files)
 
         # Vérifier les erreurs de modération AVANT de facturer
         if response.status_code == 400:
@@ -314,15 +427,36 @@ def download_video_from_api(content_url, headers, video_id):
     return True
 
 def main():
+    parser = argparse.ArgumentParser(description="Générateur de vidéo Sora2 avec support d'image de référence optionnelle")
+    parser.add_argument("--reference-image", "-r",
+                       help="Chemin ou URL de l'image de référence à utiliser")
+
+    args = parser.parse_args()
+
     print("═══════════════════════════════════════════")
     print("   🎬 Générateur de vidéo Sora2")
     print("═══════════════════════════════════════════\n")
+
+    # Déterminer l'image de référence à utiliser
+    global current_reference_image_path
+    reference_image_path = args.reference_image or REFERENCE_IMAGE
+
+    if reference_image_path:
+        print(f"🖼️  Image de référence: {reference_image_path}")
+        current_reference_image_path = reference_image_path
+        reference_image_base64 = read_reference_image(reference_image_path)
+        if reference_image_base64 is None:
+            print("❌ Impossible de charger l'image de référence, abandon...")
+            sys.exit(1)
+    else:
+        print("ℹ️  Aucune image de référence spécifiée")
+        reference_image_base64 = None
 
     # Lire le prompt
     prompt = read_prompt()
 
     # Générer la vidéo
-    success = generate_video(prompt)
+    success = generate_video(prompt, reference_image_base64)
 
     if success:
         print("\n" + "═" * 43)
