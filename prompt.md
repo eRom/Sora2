@@ -1,2 +1,1 @@
-- 2 personnes autour de l'arbre dont l'une en fauteuil roulant
-- Du vent et de la neige
+A festive LEGO Christmas market scene with various LEGO characters interacting, walking, and exchanging gifts around a beautifully decorated Christmas tree. Characters move in the snowy environment, some waving, some pushing a wheelchair, others carrying presents. The tree sparkles with lights, a warm red glow fills the scene, and joyful music plays. Camera zomm slowly across the market, capturing cheerful faces and friendly gestures.
